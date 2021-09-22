@@ -220,7 +220,9 @@ class VisionTransformer(nn.Module):
         x = self.conv1(x)  # shape = [*, width, grid, grid]
         x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
         x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
-        x = torch.cat([self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), x], dim=1)  # shape = [*, grid ** 2 + 1, width]
+        x = torch.cat(
+            [self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device),
+             x], dim=1)  # shape = [*, grid ** 2 + 1, width]
         x = x + self.positional_embedding.to(x.dtype)
         x = self.ln_pre(x)
 
@@ -234,6 +236,36 @@ class VisionTransformer(nn.Module):
             x = x @ self.proj
 
         return x
+
+
+class SoftPrompts(nn.Module):
+    def __init__(self,
+                 embedding_layer: nn.Embedding,
+                 n_prompts: int = 5,
+                 random_range: float = 0.5,
+                 initialize_from_vocab: bool = True):
+
+        super(SoftPrompts, self).__init__()
+
+        self.n_prompts = n_prompts
+        self.prompts = nn.parameter.Parameter(self.initialize_prompts(embedding_layer,
+                                                                      random_range,
+                                                                      initialize_from_vocab))
+
+    def initialize_prompts(self,
+                           embedding_layer: nn.Embedding,
+                           random_range: float,
+                           initialize_from_vocab: bool):
+        if initialize_from_vocab:
+            return embedding_layer.weight[:self.n_prompts].clone().detach()
+        else:
+            return torch.FloatTensor(self.n_prompts, embedding_layer.weight.size(1)).uniform_(-random_range,
+                                                                                              random_range)
+
+    def forward(self, tokens):
+        prompts = self.prompts.repeat(tokens.size(0), 1, 1)
+
+        return torch.cat([prompts, tokens[:, :-self.n_prompts]], 1)
 
 
 class CLIP(nn.Module):
@@ -287,6 +319,8 @@ class CLIP(nn.Module):
         self.positional_embedding = nn.Parameter(torch.empty(self.context_length, transformer_width))
         self.ln_final = LayerNorm(transformer_width)
 
+        self.soft_prompts = SoftPrompts(self.token_embedding)
+
         self.text_projection = nn.Parameter(torch.empty(transformer_width, embed_dim))
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
@@ -336,8 +370,11 @@ class CLIP(nn.Module):
     def encode_image(self, image):
         return self.visual(image.type(self.dtype))
 
-    def encode_text(self, text):
+    def encode_text(self, text, soft_prompting=False):
         x = self.token_embedding(text).type(self.dtype)  # [batch_size, n_ctx, d_model]
+
+        if soft_prompting:
+            x = self.soft_prompts(x).type(self.dtype)
 
         x = x + self.positional_embedding.type(self.dtype)
         x = x.permute(1, 0, 2)  # NLD -> LND
@@ -397,12 +434,14 @@ def build_model(state_dict: dict):
 
     if vit:
         vision_width = state_dict["visual.conv1.weight"].shape[0]
-        vision_layers = len([k for k in state_dict.keys() if k.startswith("visual.") and k.endswith(".attn.in_proj_weight")])
+        vision_layers = len(
+            [k for k in state_dict.keys() if k.startswith("visual.") and k.endswith(".attn.in_proj_weight")])
         vision_patch_size = state_dict["visual.conv1.weight"].shape[-1]
         grid_size = round((state_dict["visual.positional_embedding"].shape[0] - 1) ** 0.5)
         image_resolution = vision_patch_size * grid_size
     else:
-        counts: list = [len(set(k.split(".")[2] for k in state_dict if k.startswith(f"visual.layer{b}"))) for b in [1, 2, 3, 4]]
+        counts: list = [len(set(k.split(".")[2] for k in state_dict if k.startswith(f"visual.layer{b}"))) for b in
+                        [1, 2, 3, 4]]
         vision_layers = tuple(counts)
         vision_width = state_dict["visual.layer1.0.conv1.weight"].shape[0]
         output_width = round((state_dict["visual.attnpool.positional_embedding"].shape[0] - 1) ** 0.5)
@@ -428,5 +467,5 @@ def build_model(state_dict: dict):
             del state_dict[key]
 
     convert_weights(model)
-    model.load_state_dict(state_dict)
+    model.load_state_dict(state_dict, strict=False)
     return model.eval()
