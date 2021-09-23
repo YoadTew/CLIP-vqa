@@ -248,19 +248,17 @@ class SoftPrompts(nn.Module):
         super(SoftPrompts, self).__init__()
 
         self.n_prompts = n_prompts
-        self.prompts = nn.parameter.Parameter(self.initialize_prompts(embedding_layer,
-                                                                      random_range,
-                                                                      initialize_from_vocab))
+        self.random_range = random_range
+        self.initialize_from_vocab = initialize_from_vocab
+
+        init_prompts = torch.FloatTensor(self.n_prompts, embedding_layer.weight.size(1)).uniform_(-self.random_range,
+                                                                                                  self.random_range)
+        self.prompts = nn.parameter.Parameter(init_prompts)
 
     def initialize_prompts(self,
-                           embedding_layer: nn.Embedding,
-                           random_range: float,
-                           initialize_from_vocab: bool):
-        if initialize_from_vocab:
-            return embedding_layer.weight[:self.n_prompts].clone().detach()
-        else:
-            return torch.FloatTensor(self.n_prompts, embedding_layer.weight.size(1)).uniform_(-random_range,
-                                                                                              random_range)
+                           embedding_layer: nn.Embedding):
+        if self.initialize_from_vocab:
+            self.prompts.data = embedding_layer.weight[:self.n_prompts].clone().detach()
 
     def forward(self, tokens):
         prompts = self.prompts.repeat(tokens.size(0), 1, 1)
@@ -319,7 +317,7 @@ class CLIP(nn.Module):
         self.positional_embedding = nn.Parameter(torch.empty(self.context_length, transformer_width))
         self.ln_final = LayerNorm(transformer_width)
 
-        self.soft_prompts = SoftPrompts(self.token_embedding)
+        self.soft_prompts = SoftPrompts(self.token_embedding, initialize_from_vocab=False)
 
         self.text_projection = nn.Parameter(torch.empty(transformer_width, embed_dim))
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
@@ -468,4 +466,5 @@ def build_model(state_dict: dict):
 
     convert_weights(model)
     model.load_state_dict(state_dict, strict=False)
+    model.soft_prompts.initialize_prompts(model.token_embedding)
     return model.eval()

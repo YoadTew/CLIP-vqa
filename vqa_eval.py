@@ -1,37 +1,30 @@
 import json
+import random
 import glob
 import torch
-# import clip.clip as clip
-import clip
+import numpy as np
+import clip.clip as clip
 import pickle
 from collections import Counter, defaultdict
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 import sys
 
-from ban.vqa_dataset import VQADataset
+from vqa.vqa_dataset import VQADataset
 
+SOFT_PROMPT = True
+ITER_TO_BREAK = 999
 
-print(clip.available_models())
-device = "cuda" if torch.cuda.is_available() else "cpu"
-model, preprocess = clip.load("RN50", device=device, download_root='/home/work/checkpoints/CLIP')
+def eval_init():
+    global model, preprocess, device
 
-with open('/home/work/Datasets/vqa2/questions/v2_OpenEnded_mscoco_val2014_questions.json') as f:
-    data = json.load(f)
-    questions = data['questions']
-
-with open('/home/work/Datasets/vqa2/annotations/v2_mscoco_val2014_annotations.json') as f:
-    data = json.load(f)
-    annotations = data['annotations']
-
-with open('/home/work/Datasets/vqa2/top_answers/top_answers_val.pkl', 'rb') as f:
-    top_k_answers = pickle.load(f)
-    top_k_answers = dict([(x[0], (x[1], x[2])) for x in top_k_answers])
-
-imgs_pathes = glob.glob('/home/work/Datasets/vqa2/images/val2014/*.jpg')
-img_id_to_path = dict([(int(x.split('_')[-1].split('.')[0]), x) for x in imgs_pathes])
-
-QUESTION_TYPES = ['what are the']
+    torch.manual_seed(42)
+    np.random.seed(42)
+    random.seed(42)
+    print(clip.available_models())
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f'Using device: {device}')
+    model, preprocess = clip.load("RN50", device=device, download_root='/home/work/checkpoints/CLIP')
 
 def clip_infer(image, text):
     with torch.no_grad():
@@ -39,7 +32,7 @@ def clip_infer(image, text):
 
         b, k, n = text.size()
         text = text.view(b*k, n)
-        text_features = model.encode_text(text)
+        text_features = model.encode_text(text, soft_prompting=SOFT_PROMPT)
         text_features = text_features.view(b, k, -1)
 
         # normalized features
@@ -54,41 +47,19 @@ def clip_infer(image, text):
 
         return probs
 
-def question_caption_lambda(question, question_type):
-    # if question_type == 'what are the':
-    #     question = question[len('what are '):-1]
-    #     return lambda x: f'{question} {x}'
-    # else:
-    #     return lambda x: f'Question: {question} Answer: {x}'
-    return lambda x: f'Question: {question} Answer: {x}'
-
-def extract_gt_answers(answers):
-    gt_answers = [x['answer'] for x in answers]
-    answers_count = Counter(gt_answers)
-    answers_acc = [(k, min(answers_count[k] / 3, 1)) for k in answers_count]
-
-    gt_answers = defaultdict(int)
-    for k, v in answers_acc:
-        gt_answers[k] = v
-
-    return gt_answers
-
-
 def main():
-    type_to_question = {}
+    eval_init()
 
     TP = 0
     upper_bound_accuracy = 0
     n_samples = 0
 
     if sys.gettrace() is not None:
-        print('DEBUG!')
         N_WORKERS = 0
     else:
-        print('NOT DEBUG!')
         N_WORKERS = 4
 
-    dataset = VQADataset(questions, annotations, top_k_answers, img_id_to_path, preprocess, clip.tokenize)
+    dataset = VQADataset('/home/work/Datasets/vqa2', preprocess, clip.tokenize, 'val')
     loader = DataLoader(dataset, 256, shuffle=False, num_workers=N_WORKERS)
 
     for i, (text, image, label) in enumerate(tqdm(loader)):
@@ -103,7 +74,7 @@ def main():
         TP += label[torch.arange(256), pred_answer].sum().item()
         n_samples += image.size(0)
 
-        if i == 30:
+        if i == ITER_TO_BREAK:
             break
 
     print(f'TP: {TP}, Accuracy: {TP/n_samples}, Upper bound: {upper_bound_accuracy / n_samples}')
